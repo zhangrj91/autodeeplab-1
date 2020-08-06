@@ -316,6 +316,7 @@ class Trainer(object):
 
 def main():
     args = obtain_search_args()
+
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         try:

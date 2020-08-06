@@ -1,3 +1,4 @@
+#-- coding:UTF-8 --
 import torch.nn.functional as F
 from operations import *
 from genotypes import PRIMITIVES
@@ -8,14 +9,15 @@ class MixedOp(nn.Module):
     def __init__(self, C, stride):
         super(MixedOp, self).__init__()
         self._ops = nn.ModuleList()
-        for primitive in PRIMITIVES:
-            op = OPS[primitive](C, stride, False, False)
+        for primitive in PRIMITIVES:#PRIMITIVES中就是8个操作
+            op = OPS[primitive](C, stride, False, False)#OPS中存储了各种操作的函数
             if 'pool' in primitive:
-                op = nn.Sequential(op, nn.BatchNorm2d(C, affine=False))
-            self._ops.append(op)
+                op = nn.Sequential(op, nn.BatchNorm2d(C, affine=False))#给池化操作后面加一个batchnormalization
+            self._ops.append(op)#把这些op都放在预先定义好的modulelist里
 
     def forward(self, x, weights):
-        return sum(w * op(x) for w, op in zip(weights, self._ops))
+        return sum(w * op(x) for w, op in zip(weights, self._ops))#op(x)就是对输入x做一个相应的操作 w1*op1(x)+w2*op2(x)+...+w8*op8(x)
+                                                                #也就是对输入x做8个操作并乘以相应的权重，把结果加起来
 
 
 class Cell(nn.Module):
@@ -26,25 +28,32 @@ class Cell(nn.Module):
 
         super(Cell, self).__init__()
 
+        # 输入总channel
         self.C_in = block_multiplier * filter_multiplier
+        # 输出channel
         self.C_out = filter_multiplier
 
+        # l-2的Cell的channel
         self.C_prev_prev = int(prev_prev_fmultiplier * block_multiplier)
+        # lateral的arrow对应的前一个Cell的channel
         self._prev_fmultiplier_same = prev_fmultiplier_same
 
+        # 向下的arrow对应的channel
         if prev_fmultiplier_down is not None:
             self.C_prev_down = int(prev_fmultiplier_down * block_multiplier)
             self.preprocess_down = ReLUConvBN(
                 self.C_prev_down, self.C_out, 1, 1, 0, affine=False)
+        # 向右
         if prev_fmultiplier_same is not None:
             self.C_prev_same = int(prev_fmultiplier_same * block_multiplier)
             self.preprocess_same = ReLUConvBN(
                 self.C_prev_same, self.C_out, 1, 1, 0, affine=False)
+        # 向上
         if prev_fmultiplier_up is not None:
             self.C_prev_up = int(prev_fmultiplier_up * block_multiplier)
             self.preprocess_up = ReLUConvBN(
                 self.C_prev_up, self.C_out, 1, 1, 0, affine=False)
-
+        # 有上上层layer的Cell
         if prev_prev_fmultiplier != -1:
             self.pre_preprocess = ReLUConvBN(
                 self.C_prev_prev, self.C_out, 1, 1, 0, affine=False)
@@ -53,23 +62,28 @@ class Cell(nn.Module):
         self.block_multiplier = block_multiplier
         self._ops = nn.ModuleList()
 
+        # 遍历5个Block构建混合操作
         for i in range(self._steps):
-            for j in range(2 + i):
+            # 遍历当前结点i的所有前驱节点
+            for j in range(2 + i):#对第i个节点来说，它有个j个前驱节点（每个节点的input都由前两个cell的输出和当前cell的前面的节点组成）
                 stride = 1
+                #当没有前前节点，设置该部分为None
                 if prev_prev_fmultiplier == -1 and j == 0:
                     op = None
                 else:
-                    op = MixedOp(self.C_out, stride)
-                self._ops.append(op)
+                    op = MixedOp(self.C_out, stride)#op是构建两个节点之间的混合
+                self._ops.append(op)#所有边的混合操作添加到ops，list的len为2+3+4+5+6=20[[],[],...,[]]
 
         # self.ReLUConvBN = ReLUConvBN(self.C_in, self.C_out, 1, 1, 0)
 
         self._initialize_weights()
 
+    # 调整纬度，放缩
     def scale_dimension(self, dim, scale):
         assert isinstance(dim, int)
         return int((float(dim) - 1.0) * scale + 1.0) if dim % 2 else int(dim * scale)
 
+    # 重新调整up arrow 或者 down arrow 对应的前一个Cell的输入分辨率
     def prev_feature_resize(self, prev_feature, mode):
         if mode == 'down':
             feature_size_h = self.scale_dimension(prev_feature.shape[2], 0.5)
@@ -77,23 +91,29 @@ class Cell(nn.Module):
         elif mode == 'up':
             feature_size_h = self.scale_dimension(prev_feature.shape[2], 2)
             feature_size_w = self.scale_dimension(prev_feature.shape[3], 2)
-
+        # 使用插值进行上采样或者下采样
         return F.interpolate(prev_feature, (feature_size_h, feature_size_w), mode='bilinear', align_corners=True)
 
     def forward(self, s0, s1_down, s1_same, s1_up, n_alphas):
 
+        # 从高一层输入
         if s1_down is not None:
+            # 调整特征图分辨率
             s1_down = self.prev_feature_resize(s1_down, 'down')
+            # 预处理
             s1_down = self.preprocess_down(s1_down)
+            # 取得输出的特征图h，w
             size_h, size_w = s1_down.shape[2], s1_down.shape[3]
         if s1_same is not None:
             s1_same = self.preprocess_same(s1_same)
             size_h, size_w = s1_same.shape[2], s1_same.shape[3]
+        # 从低一层输入
         if s1_up is not None:
             s1_up = self.prev_feature_resize(s1_up, 'up')
             s1_up = self.preprocess_up(s1_up)
             size_h, size_w = s1_up.shape[2], s1_up.shape[3]
-        all_states = []
+        all_states = []#当前节点的前驱节点
+        # s0为前前节点输出
         if s0 is not None:
             # s0 = self.pre_preprocess(s0)
             s0 = F.interpolate(s0, (size_h, size_w), mode='bilinear', align_corners=True) if (s0.shape[2] != size_h) or (s0.shape[3] != size_w) else s0
@@ -121,8 +141,10 @@ class Cell(nn.Module):
         final_concates = []
         for states in all_states:
             offset = 0
+            # 对于每个Block（5个）
             for i in range(self._steps):
                 new_states = []
+                # 对于每个Block都进行三层的op计算
                 for j, h in enumerate(states):
                     branch_index = offset + j
                     if self._ops[branch_index] is None:
